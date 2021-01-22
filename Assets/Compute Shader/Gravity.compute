@@ -1,0 +1,62 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+
+
+const float Softening = 3e4f;
+#define Softening2  Softening * Softening
+
+struct Particle {
+	float3 position;
+	float3 velocity;
+};
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWStructuredBuffer<Particle> particleBuffers;
+
+
+static float G = 6.67300e-11f;
+static float DefaultMass = 10000.0f;
+static float GMM = G * DefaultMass * DefaultMass;
+
+float _deltaTime;
+int _numofParticles;
+float2 _mousePos;
+
+[numthreads(256, 1, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+	// TODO: insert actual code here!
+	//float3 delta = float3(_mousePos, 0) - particleBuffer[id.x].position;
+	//float3 direction = normalize(delta);
+	//float length = (dot(delta, delta));
+
+	//particleBuffer[id.x].velocity +=  0.1 * length * direction;
+	//particleBuffer[id.x].position += particleBuffer[id.x].velocity * _deltaTime;
+
+	int j = id.x;
+
+	float3 position = particleBuffers[id.x].position;
+	float3 velocity = particleBuffers[id.x].velocity;
+	float3 A = float3(0,0,0);
+
+	[loop]
+	for (int i = 0; i < _numofParticles; i++)
+	{
+		if (i != j)
+		{
+			float3 delta = particleBuffers[i].position - position;
+			float l = length(delta);
+			float f = (GMM ) / (l * l + Softening2);
+			A += f * normalize(delta);
+		}		
+	}
+	velocity += A * _deltaTime;
+	position += velocity * _deltaTime;
+
+	if (j < _numofParticles)
+	{
+		particleBuffers[j].velocity = velocity;
+		particleBuffers[j].position = position;
+	}
+}

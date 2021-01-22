@@ -1,0 +1,300 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel Initialize
+#pragma kernel ComputeExternalForce
+#pragma kernel ComputeTimeIntegration
+#pragma kernel CollisionResoloution
+#pragma kernel UpdateDensity
+#pragma kernel ViscosityForce
+#pragma kernel PsuedoViscosityVelocity
+#pragma kernel CalcFinalVel
+#pragma kernel ComputePressureFromEOS
+#pragma kernel ComputeGradientForcePressure
+
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+
+#define PI 3.14159265358979323846264338327950288
+#define THREAD_NUM 128
+
+#define SIZE_CUBE float3(5, 33, 5)
+#define CENTER_CUBE float3(0, 27, 0)
+
+float dimension = 16;
+
+float _numParticles;
+float _mass;
+float _dragCoef;
+float _gravity;
+float _deltaTime;
+float _restutionCoeff;
+float _frictionScale;
+uint3 _resoloution;
+float _gridSpacing;
+float _kernelRadius;
+float _viscosityCoeff;
+float _smoothFactor;
+float _targetDensity;
+float _eosExponent;
+float _soundSpeed;
+
+#define MAX_PRESSURE _targetDensity * 10
+
+struct interval {
+	int start;
+	int end;
+};
+
+Texture2D<float4> neighbours;
+RWStructuredBuffer<float3> _velocities;
+RWStructuredBuffer<float3> _forces;
+RWStructuredBuffer<float3> _positions;
+RWStructuredBuffer<float3> _winds;
+RWStructuredBuffer<float> _densities;
+RWStructuredBuffer<float> _pressures;
+RWStructuredBuffer<float3> _pressureForces;
+RWStructuredBuffer<float3> _smoothVelocities;
+StructuredBuffer<float> _neighbours;
+StructuredBuffer<interval> _neighbourIndices;
+RWStructuredBuffer<float> test;
+RWStructuredBuffer<float3> test_vec;
+
+
+struct SphStdKernel {
+	float h;
+	float Kernel(float r) {
+		if (r * r >= h * h) {
+			return 0;
+		}
+		else {
+			float x = (h * h - r * r);
+			float x3 = x * x * x;
+			return (315 / (64 * PI * h * h * h * h * h * h * h * h * h)) * x3;
+		}
+	}
+};
+
+struct SphSpikyKernel {
+	float h;
+	float Kernel(float r) {
+		if (r >= h) {
+			return 0;
+		}
+		else {
+			float x = (1 - r / h);
+			float x3 = x * x * x;
+			return (15 / (PI * h * h * h)) * x3;
+		}
+	}
+	
+	float FirstDerivative(float r) {
+		if (r >= h) {
+			return 0;
+		}
+		else {
+			float x = (h - r);
+			float x2 = x * x;
+			return (-45 / (PI * h * h * h * h * h * h)) * x2;
+		}
+	}
+
+	float SecondDerivative(float r) {
+		if (r >= h) {
+			return 0;
+		}
+		else {
+			float x = (h - r);
+			return (90.0 / (PI * h * h * h * h * h * h)) * x;
+		}
+	}
+
+	float3 Gradient(float r, float3 dirToCenter) {
+		return -FirstDerivative(r) * dirToCenter;
+	}
+};
+
+[numthreads(THREAD_NUM, 1, 1)]
+void Initialize(uint3 id : SV_DispatchThreadID)
+{
+	_velocities[id.x] = float3(0, 0, 0);
+	_forces[id.x] = float3(0, 0, 0);
+	dimension = 16;
+	float dimension2 = dimension * dimension;
+	float r = _kernelRadius;
+	_positions[id.x] = float3((id.x % dimension2) / dimension * r - SIZE_CUBE.x / 4,
+		 id.x / dimension2 * 0.1 - SIZE_CUBE.z / 4, (id.x % dimension2) % dimension * r);
+	_densities[id.x] = 0;
+	_pressures[id.x] = 0;
+}
+
+[numthreads(THREAD_NUM, 1, 1)]
+void ComputeExternalForce(uint3 id : SV_DispatchThreadID) {
+	float3 force = _mass * float3(0, _gravity, 0);
+	float3 relVel = _winds[id.x] - _velocities[id.x];
+	_winds[id.x] = _dragCoef * _winds[id.x];
+	force += -_dragCoef * relVel;
+	_forces[id.x] += force;
+}
+
+[numthreads(THREAD_NUM, 1, 1)]
+void ComputeTimeIntegration(uint3 id : SV_DispatchThreadID) {
+	_velocities[id.x] = (_forces[id.x] / _mass) * _deltaTime + _velocities[id.x];
+	_positions[id.x] = _velocities[id.x] * _deltaTime + _positions[id.x];
+}
+
+float IsOnBox(float3 p, float3 c, float3 size) {
+	float x = abs(p.x - c.x) - size.x;
+	float y = abs(p.y - c.y) - size.y;
+	float z = abs(p.z - c.z) - size.z;
+	float e = length(max(float3(x, y, z), 0));
+	float i = min(max(max(x, y), z), 0);
+	return e + i;
+}
+
+float3 GetNormal(float3 p) {
+	float d = IsOnBox(p, CENTER_CUBE, SIZE_CUBE);
+	float2 e = float2(0.01, 0);
+	float3 n = d - float3(
+		IsOnBox(p - e.xyy, CENTER_CUBE, SIZE_CUBE),
+		IsOnBox(p - e.yxy, CENTER_CUBE, SIZE_CUBE),
+		IsOnBox(p - e.yyx, CENTER_CUBE, SIZE_CUBE));
+	return -normalize(n);
+}
+
+[numthreads(THREAD_NUM, 1, 1)]
+void CollisionResoloution(uint3 id : SV_DispatchThreadID) {
+	
+	if (IsOnBox(_positions[id.x], CENTER_CUBE, SIZE_CUBE) > 0) {
+		/*if (id.x == 0) {
+			test[0] = 1;
+			test_vec[0] = float3(IsOnBox(_positions[id.x], CENTER_CUBE, SIZE_CUBE), 10, 1);
+		}*/
+		float3 targetNormal = GetNormal(_positions[id.x]);
+		float3 targetPoint = _positions[id.x] + targetNormal * 0.01f;
+		float3 relVel = _velocities[id.x];
+		float normalDotVel = dot(targetNormal, relVel);
+		float3 relVelN = normalDotVel * targetNormal;
+		float3 relVelT = relVel - relVelN;
+		if (normalDotVel < 0.0) {
+			float3 deltaRelVelN = -(_restutionCoeff + 1) * relVelN;
+			relVelN *= -_restutionCoeff;
+			if (length(relVelT) * length(relVelT) > 0.0) {
+				float frictionCoeff = max(1 - _frictionScale * (length(deltaRelVelN) / length(relVelT)), 0);
+				relVelT *= frictionCoeff;
+			}
+			_velocities[id.x] = relVelN + relVelT;
+		}
+		_positions[id.x] = targetPoint;
+	}
+}
+
+[numthreads(THREAD_NUM, 1, 1)]
+void UpdateDensity(uint3 id : SV_DispatchThreadID) {
+	SphStdKernel kern;
+	kern.h = _kernelRadius;
+	uint num, stride;
+	float sum = 0;
+	_positions.GetDimensions(num, stride);
+	[loop]
+	for (uint i = 0; i < num; i++) {
+		float distance = length(_positions[id.x] - _positions[i]);
+		if (distance < _kernelRadius) {
+			float weight = _mass * kern.Kernel(distance);
+			sum += weight;
+		}
+	}
+	_densities[id.x] = sum;
+}
+
+[numthreads(THREAD_NUM, 1, 1)]
+void ViscosityForce(uint3 id : SV_DispatchThreadID) {
+	SphSpikyKernel kern;
+	kern.h = _kernelRadius;
+	uint num, stride;
+	_positions.GetDimensions(num, stride);
+	float3 viscosityForce = float3(0, 0, 0);
+	[loop]
+	for (int i = 0; i < num; i++) {
+		float distance = length(_positions[id.x] - _positions[i]);
+		if (distance < _kernelRadius) {
+			float kernel = kern.SecondDerivative(distance);
+			float3 weight = (_velocities[i] - _velocities[id.x]) / (_densities[i] + _densities[id.x]);
+			viscosityForce += _mass * _viscosityCoeff * kernel * weight;
+		}
+	}
+	_forces[id.x] += viscosityForce;
+}
+
+[numthreads(THREAD_NUM, 1, 1)]
+void PsuedoViscosityVelocity(uint3 id : SV_DispatchThreadID) {
+	SphStdKernel kern;
+	float filterRadius = _kernelRadius;
+	kern.h = filterRadius;
+	float weightSum = 0;
+	float3 smoothVel = float3(0, 0, 0);
+	uint num, stride;
+	_positions.GetDimensions(num, stride);
+	[loop]
+	for (int i = 0; i < num; i++) {
+		float distance = length(_positions[id.x] - _positions[i]);
+		if (distance < filterRadius) {
+			float weight = _mass * kern.Kernel(distance) / _densities[i];
+			weightSum += weight;
+			float3 currSmoothVel = weight * _velocities[i];
+			smoothVel += currSmoothVel;
+		}
+	}
+	weightSum += _mass / _densities[id.x];
+	smoothVel += (_mass / _densities[id.x]) * _velocities[id.x];
+	if (weightSum > 0) {
+		smoothVel /= weightSum;
+	}
+	_smoothVelocities[id.x] = smoothVel;
+}
+
+[numthreads(THREAD_NUM, 1, 1)]
+void CalcFinalVel(uint3 id : SV_DispatchThreadID) {
+	_velocities[id.x] = lerp(_velocities[id.x], _smoothVelocities[id.x], _viscosityCoeff);
+}
+
+[numthreads(THREAD_NUM, 1, 1)]
+void ComputePressureFromEOS(uint3 id : SV_DispatchThreadID) {
+	float sqrSound = _soundSpeed * _soundSpeed;
+	float eosScale = _targetDensity * sqrSound / _eosExponent;
+	float base = _densities[id.x] / _targetDensity - 1;
+	float pressure = eosScale / _eosExponent * pow(base, _eosExponent);
+	if (pressure < 0) {
+		pressure *= 0;
+	}
+	_pressures[id.x] = min(pressure, MAX_PRESSURE) * sign(pressure);
+}
+
+[numthreads(THREAD_NUM, 1, 1)]
+void ComputeGradientForcePressure(uint3 id : SV_DispatchThreadID) {
+	SphSpikyKernel kern;
+	kern.h = _kernelRadius;
+	uint num, stride;
+	_positions.GetDimensions(num, stride);
+	float3 pressureForce = float3(0, 0, 0);
+	[loop]
+	for (int i = 0; i < num; i++) {
+		float distance = length(_positions[id.x] - _positions[i]);
+		if (distance < _kernelRadius && id.x != i) {
+			float3 dirToCenter;
+			if (distance > 0) {
+				 dirToCenter = normalize(_positions[i] - _positions[id.x]);
+			}
+			else {
+				dirToCenter = float3(0, 1, 0);
+			}
+			dirToCenter = normalize(dirToCenter);
+			float3 gradient = kern.Gradient(distance, dirToCenter);
+			float value = (_pressures[id.x] + _pressures[i]) / (2 * _densities[i]);
+			float3 force = _mass * value * gradient ;
+			pressureForce -= force;	
+		}
+	}
+	_forces[id.x] += pressureForce;
+}
+
+

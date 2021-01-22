@@ -1,0 +1,336 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel ComputeGravity
+#pragma kernel TestGradient
+#pragma kernel TestDivergence
+#pragma kernel TestDivergenceFaceCentered
+#pragma kernel TestLaplacian
+#pragma kernel TestInterpolation
+#pragma kernel TestSampler1
+#pragma kernel TestSampler2
+
+#define THREAD_NUM 8
+
+float3 gridSpacing;
+float3 dataSize;
+float3 origin;
+float gravity;
+float deltaTime;
+
+RWStructuredBuffer<float> scalarData;
+RWStructuredBuffer<float3> vectorData;
+RWStructuredBuffer<float> u;
+RWStructuredBuffer<float> v;
+RWStructuredBuffer<float> w;
+RWStructuredBuffer<float> t;
+
+
+float Convert3DTo1D(float3 index3, float3 ds) {
+	return index3.z * ds.y * ds.x + index3.y * ds.x + index3.x;
+}
+
+float square(float x) {
+	return x * x;
+}
+
+float cubic(float x) {
+	return x * x * x;
+}
+
+void GetAxisWeightIndex(float x, float minX, float maxX, out float i, out float fx) {
+	float s = floor(x);
+	float offset = minX;
+	s -= offset;
+	maxX -= offset;
+	minX -= offset;
+	if (minX == maxX) {
+		i = minX;
+		fx = 0;
+	}
+	else if (s >= maxX - 1) {
+		i = maxX - 1;
+		fx = 1;
+	}
+	else if (s < minX) {
+		i = minX;
+		fx = 0;
+	}
+	else {
+		i = s;
+		fx = x - s;
+	}
+}
+
+float lerp(float f0, float f1, float t) {
+	return (1 - t) * f0 + t * f1;
+}
+
+float bilerp(float f00, float f10, float f01, float f11, float tx, float ty) {
+	return lerp(lerp(f00, f10, tx), lerp(f01, f11, tx), ty);
+}
+
+float trilerp(float f000, float f100, float f010, float f110, float f001, float f101, float f011, float f111,
+	float tx, float ty, float tz) {
+	return lerp(bilerp(f000, f100, f010, f110, tx, ty), bilerp(f001, f101, f011, f111, tx, ty), tz);
+}
+
+float monotonicCatmullRom(float f0, float f1, float f2, float f3, float f) {
+	float v0 = (f2 - f0) / 2;
+	float v1 = (f3 - f1) / 2;
+	float D = f2 - f1;
+
+	if (abs(D) < 0.001) {
+		v0 = 0;
+		v1 = 0;
+	}
+	if (sign(D) != sign(v0)) {
+		v0 = 0;
+	}
+	if (sign(D) != sign(v1)) {
+		v1 = 0;
+	}
+
+	float a0 = f1;
+	float a1 = v0;
+	float a2 = 3 * D - 2 * v0 - v1;
+	float a3 = -2 * D + v0 + v1;
+
+	return a3 * cubic(f) + a2 * square(f) + a1 * f + a0;
+}
+
+void GetCoordinationWeights(float3 position, out int3 indices[8], out float weight[8]) {
+	float fx, fy, fz;
+	float i, j, k;
+	float3 normalizedPosition = (position - origin) / gridSpacing;
+	float maxX = dataSize.x;
+	float maxY = dataSize.y;
+	float maxZ = dataSize.z;
+	GetAxisWeightIndex(normalizedPosition.x, 0, maxX, i, fx);
+	GetAxisWeightIndex(normalizedPosition.y, 0, maxY, j, fy);
+	GetAxisWeightIndex(normalizedPosition.z, 0, maxZ, k, fz);
+	float ip1 = min(i + 1, maxX - 1);
+	float jp1 = min(j + 1, maxY - 1);
+	float kp1 = min(k + 1, maxZ - 1);
+
+	indices[0] = int3((int)i, (int)j, (int)k);
+	indices[1] = int3((int)ip1, (int)j, (int)k);
+	indices[2] = int3((int)i, (int)jp1, (int)k);
+	indices[3] = int3((int)i, (int)j, (int)kp1);
+	indices[4] = int3((int)ip1, (int)jp1, (int)k);
+	indices[5] = int3((int)ip1, (int)j, (int)kp1);
+	indices[6] = int3((int)i, (int)jp1, (int)kp1);
+	indices[7] = int3((int)ip1, (int)jp1, (int)kp1);
+
+	weight[0] = (1 - fx) * (1 - fy) * (1 - fz);
+	weight[1] = fx * (1 - fy) * (1 - fz);
+	weight[2] = (1 - fx) * fy * (1 - fz);
+	weight[3] = (1 - fx) * (1 - fy) * fz;
+	weight[4] = fx * fy * (1 - fz);
+	weight[5] = fx * (1 - fy) * fz;
+	weight[6] = (1 - fx) * fy * fz;
+	weight[7] = fx * fy * fz;
+}
+
+float LinearSampler(float3 position) {
+	float fx, fy, fz;
+	float i, j, k;
+	float3 normalizedPosition = (position - origin) / gridSpacing;
+	float maxX = dataSize.x;
+	float maxY = dataSize.y;
+	float maxZ = dataSize.z;
+	GetAxisWeightIndex(normalizedPosition.x, 0, maxX, i, fx);
+	GetAxisWeightIndex(normalizedPosition.y, 0, maxY, j, fy);
+	GetAxisWeightIndex(normalizedPosition.z, 0, maxZ, k, fz);
+	float ip1 = min(i + 1, maxX - 1);
+	float jp1 = min(j + 1, maxY - 1);
+	float kp1 = min(k + 1, maxZ - 1);
+
+	return trilerp(
+		scalarData[(int)Convert3DTo1D(float3(i, j, k), dataSize)],
+		scalarData[(int)Convert3DTo1D(float3(ip1, j, k), dataSize)],
+		scalarData[(int)Convert3DTo1D(float3(i, jp1, k), dataSize)],
+		scalarData[(int)Convert3DTo1D(float3(ip1, jp1, k), dataSize)],
+		scalarData[(int)Convert3DTo1D(float3(i, j, kp1), dataSize)],
+		scalarData[(int)Convert3DTo1D(float3(ip1, j, kp1), dataSize)],
+		scalarData[(int)Convert3DTo1D(float3(i, jp1, kp1), dataSize)],
+		scalarData[(int)Convert3DTo1D(float3(ip1, jp1, kp1), dataSize)],
+		fx, fy, fz);
+}
+
+float CubicSampler(float3 position) {
+	float fx, fy, fz;
+	float i, j, k;
+	float3 normalizedPosition = (position - origin) / gridSpacing;
+	float maxX = dataSize.x;
+	float maxY = dataSize.y;
+	float maxZ = dataSize.z;
+	GetAxisWeightIndex(normalizedPosition.x, 0, maxX, i, fx);
+	GetAxisWeightIndex(normalizedPosition.y, 0, maxY, j, fy);
+	GetAxisWeightIndex(normalizedPosition.z, 0, maxZ, k, fz);
+	float is[4] = { max(i - 1, 0), i, min(i + 1, maxX - 1), min(i + 2, maxX - 1) };
+	float js[4] = { max(j - 1, 0), j, min(j + 1, maxY - 1), min(j + 2, maxY - 1) };
+	float ks[4] = { max(k - 1, 0), k, min(k + 1, maxZ - 1), min(k + 2, maxZ - 1) };
+
+	float kValues[4];
+	for (int kk = 0; kk < 4; kk++) {
+		float jValues[4];
+		for (int jj = 0; jj < 4; jj++) {
+			jValues[jj] = monotonicCatmullRom(
+				scalarData[(int)Convert3DTo1D(float3(is[0], js[jj], ks[kk]), dataSize)],
+				scalarData[(int)Convert3DTo1D(float3(is[1], js[jj], ks[kk]), dataSize)],
+				scalarData[(int)Convert3DTo1D(float3(is[2], js[jj], ks[kk]), dataSize)],
+				scalarData[(int)Convert3DTo1D(float3(is[3], js[jj], ks[kk]), dataSize)], fx);
+		}
+		kValues[kk] = monotonicCatmullRom(jValues[0], jValues[1], jValues[2], jValues[3], fy);
+	}
+	return monotonicCatmullRom(kValues[0], kValues[1], kValues[2], kValues[3], fz);
+}
+
+float3 GradientAtDataPoint(int i, int j, int k, float3 ds) {
+	float3 leftInd = float3((i > 0) ? i - 1 : i, j, k);
+	float left = scalarData[(int)Convert3DTo1D(leftInd, ds)];
+	float3 rightInd = float3((i < ds.x - 1) ? i + 1 : i, j, k);
+	float right = scalarData[(int)Convert3DTo1D(rightInd, ds)];
+	float3 upInd = float3(i, (j < ds.y - 1) ? j + 1 : j, k);
+	float up = scalarData[(int)Convert3DTo1D(upInd, ds)];
+	float3 downInd = float3(i, (j > 0) ? j - 1 : j, k);
+	float down = scalarData[(int)Convert3DTo1D(downInd, ds)];
+	float3 forwardInd = float3(i, j, (k < ds.z - 1) ? k + 1 : k);
+	float forward = scalarData[(int)Convert3DTo1D(forwardInd, ds)];
+	float3 backInd = float3(i, j, (k > 0) ? k - 1 : k);
+	float back = scalarData[(int)Convert3DTo1D(backInd, ds)];
+	if (i == 0 && j == 0 && k == 0) {
+		t[0] = right;
+	}
+	return 0.5 * float3(right - left, up - down, forward - back) / gridSpacing;
+}
+
+float DivergenceAtDataPoint(int i, int j, int k, float3 ds) {
+	float3 leftInd = float3((i > 0) ? i - 1 : i, j, k);
+	float left = vectorData[(int)Convert3DTo1D(leftInd, ds)].x;
+	float3 rightInd = float3((i < ds.x - 1) ? i + 1 : i, j, k);
+	float right = vectorData[(int)Convert3DTo1D(rightInd, ds)].x;
+	float3 upInd = float3(i, (j < ds.y - 1) ? j + 1 : j, k);
+	float up = vectorData[(int)Convert3DTo1D(upInd, ds)].y;
+	float3 downInd = float3(i, (j > 0) ? j - 1 : j, k);
+	float down = vectorData[(int)Convert3DTo1D(downInd, ds)].y;
+	float3 forwardInd = float3(i, j, (k < ds.z - 1) ? k + 1 : k);
+	float forward = vectorData[(int)Convert3DTo1D(forwardInd, ds)].z;
+	float3 backInd = float3(i, j, (k > 0) ? k - 1 : k);
+	float back = vectorData[(int)Convert3DTo1D(backInd, ds)].z;
+	if (i == 0 && j == 0 && k == 0) {
+		t[0] = right - left;
+	}
+	return 0.5 * ((right - left) / gridSpacing.x + (up - down) / gridSpacing.y + (forward - back) / gridSpacing.z);
+}
+
+float FaceCenteredDivergenceAtDataPoint(int i, int j, int k, float3 ds) {
+	float3 leftInd = float3(i, j, k);
+	float3 rightInd = float3(i + 1, j, k);
+	float3 downInd = float3(i, j, k);
+	float3 upInd = float3(i, j + 1, k);
+	float3 backInd = float3(i, j, k);
+	float3 forwardInd = float3(i, j, k + 1);
+	float left_u = u[(int)Convert3DTo1D(leftInd, ds)];
+	float right_u = u[(int)Convert3DTo1D(rightInd, ds)];
+	float up_v = v[(int)Convert3DTo1D(upInd, ds)];
+	float down_v = v[(int)Convert3DTo1D(downInd, ds)];
+	float back_w = w[(int)Convert3DTo1D(backInd, ds)];
+	float forward_w = w[(int)Convert3DTo1D(forwardInd, ds)];
+	return 0.5 * ((right_u - left_u) / gridSpacing.x + (up_v - down_v) / gridSpacing.y + (forward_w - back_w) / gridSpacing.z);
+}
+
+float LaplacianAtDataPoint(int i, int j, int k, float3 ds) {
+	float3 centerInd = float3(i, j, k);
+	float center = scalarData[(int)Convert3DTo1D(centerInd, ds)];
+	float dleft = 0, dright = 0, dup = 0, ddown = 0, dforward = 0, dback = 0;
+	if (i > 0) {
+		float3 leftInd = float3(i - 1, j, k);
+		dleft = center - scalarData[(int)Convert3DTo1D(leftInd, ds)];
+	}
+	if (i < ds.x - 1) {
+		float3 rightInd = float3(i + 1, j, k);
+		dright = scalarData[(int)Convert3DTo1D(rightInd, ds)] - center;
+	}
+	if (j > 0) {
+		float3 downInd = float3(i, j - 1, k);
+		ddown = center - scalarData[(int)Convert3DTo1D(downInd, ds)];
+	}
+	if (j < ds.y - 1) {
+		float3 upInd = float3(i, j + 1, k);
+		dup = scalarData[(int)Convert3DTo1D(upInd, ds)] - center;
+	}
+	if (k > 0) {
+		float3 backInd = float3(i, j, k - 1);
+		dback = center - scalarData[(int)Convert3DTo1D(backInd, ds)];
+	}
+	if (k < ds.z - 1) {
+		float3 forwardInd = float3(i, j, k + 1);
+		dforward = scalarData[(int)Convert3DTo1D(forwardInd, ds)] - center;
+	}
+	return (dright - dleft) / square(gridSpacing.x) + (dup - ddown) / square(gridSpacing.y) + (dforward - dback) / square(gridSpacing.z);
+}
+
+[numthreads(THREAD_NUM, THREAD_NUM, THREAD_NUM)]
+void ComputeGravity(uint3 id : SV_DispatchThreadID) {
+	float a;
+	int index = (int)Convert3DTo1D(float3(id.xyz), dataSize);
+	scalarData[index] += deltaTime * gravity;
+}
+
+// Test
+
+[numthreads(2, 2, 2)]
+void TestGradient(uint3 id : SV_DispatchThreadID)
+{
+	float3 idx = float3(id.x, id.y, id.z);
+	vectorData[(int)Convert3DTo1D(idx, dataSize)] = GradientAtDataPoint(id.x, id.y, id.z, dataSize);
+}
+
+[numthreads(2, 2, 2)]
+void TestDivergence(uint3 id : SV_DispatchThreadID)
+{
+	float3 idx = float3(id.x, id.y, id.z);
+	scalarData[(int)Convert3DTo1D(idx, dataSize)] = DivergenceAtDataPoint(id.x, id.y, id.z, dataSize);
+}
+
+[numthreads(2, 2, 2)]
+void TestDivergenceFaceCentered(uint3 id : SV_DispatchThreadID)
+{
+	float3 idx = float3(id.x, id.y, id.z);
+	scalarData[(int)Convert3DTo1D(idx, dataSize)] = FaceCenteredDivergenceAtDataPoint(id.x, id.y, id.z, dataSize);
+}
+
+[numthreads(2, 2, 2)]
+void TestLaplacian(uint3 id : SV_DispatchThreadID)
+{
+	float3 idx = float3(id.x, id.y, id.z);
+	u[(int)Convert3DTo1D(idx, dataSize)] = LaplacianAtDataPoint(id.x, id.y, id.z, dataSize);
+}
+
+[numthreads(1, 1, 1)]
+void TestInterpolation(uint3 id : SV_DispatchThreadID)
+{
+	t[0] = monotonicCatmullRom(4, 5, 1, 2, 0.25);
+}
+
+[numthreads(2, 2, 2)]
+void TestSampler1(uint3 id : SV_DispatchThreadID)
+{
+	int3 idxs[8];
+	float weights[8];
+	float3 position = float3(0.5, 0.7, 0.1);
+	GetCoordinationWeights(position, idxs, weights);
+	[loop]
+	for (int i = 0; i < 8; i++) {
+		t[i] = weights[i];
+		vectorData[i] = idxs[i];
+	}
+
+}
+
+[numthreads(1, 1, 1)]
+void TestSampler2(uint3 id : SV_DispatchThreadID)
+{
+	float x = CubicSampler(float3(0.5, 0.1, 0.2));
+	t[0] = x;
+}

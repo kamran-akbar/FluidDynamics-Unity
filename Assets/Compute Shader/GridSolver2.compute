@@ -1,0 +1,190 @@
+﻿#pragma kernel Render
+#pragma kernel SetBoundry
+#pragma kernel LinearSolve
+#pragma kernel CopyArray
+#pragma kernel DivergencePressure
+#pragma kernel GradientPressure
+#pragma kernel Advect
+
+#define NUM_THREADS 32
+
+float2 resoloution;
+float type;
+float coeff;
+float inv_diam;
+float dtx, dty;
+
+RWTexture2D<float4> finalTex;
+
+StructuredBuffer<float> b;
+RWStructuredBuffer<float> value;
+RWStructuredBuffer<float> pValue;
+RWStructuredBuffer<float> result;
+RWStructuredBuffer<float> density;
+RWStructuredBuffer<float> Velx;
+RWStructuredBuffer<float> Vely;
+RWStructuredBuffer<float> divergence;
+RWStructuredBuffer<float> pressure;
+RWStructuredBuffer<float> test;
+
+int IX(int x, int y) {
+	x = x % resoloution.x;
+	y = y % resoloution.y;
+	return y * resoloution.x + x;
+}
+
+float Lerp(float x0, float x1, float f)
+{
+	return (1 - f) * x0 + f * x1;
+}
+
+float BiLerp(float x00, float x10, float x01, float x11, float fx, float fy)
+{
+	return Lerp(Lerp(x00, x10, fx), Lerp(x01, x11, fx), fy);
+}
+
+[numthreads(NUM_THREADS, NUM_THREADS, 1)]
+void Render(uint3 id : SV_DispatchThreadID) {
+	float d = density[IX(id.x, id.y)];
+	finalTex[id.xy] = float4(0.2 * d, 0.42 * d, 0.47 * d, 1);
+	density[IX(id.x, id.y)] -= 0.02;
+}
+
+[numthreads(NUM_THREADS, NUM_THREADS, 1)]
+void SetBoundry(uint3 id : SV_DispatchThreadID) {
+	if (id.y != 0 && id.y != resoloution.y - 1) {
+		value[IX(0, id.y)] = type == 1 ? -value[IX(1, id.y)] : value[IX(1, id.y)];
+		value[IX(resoloution.x - 1, id.y)] = type == 1 ? -value[IX(resoloution.x - 2, id.y)] : value[IX(resoloution.x - 2, id.y)];
+	}
+
+	if (id.x != 0 && id.x != resoloution.x - 1) {
+		value[IX(id.x, 0)] = type == 2 ? -value[IX(id.x, 1)] : value[IX(id.x, 1)];
+		value[IX(id.x, resoloution.y - 1)] = type == 2 ? -value[IX(id.x, resoloution.y - 2)] : value[IX(id.x, resoloution.y - 2)];
+	}
+}
+
+[numthreads(NUM_THREADS, NUM_THREADS, 1)]
+void LinearSolve(uint3 id : SV_DispatchThreadID) {
+	int x = id.x;
+	int y = id.y;
+	if (x != 0 && x != resoloution.x - 1 && y != 0 && y != resoloution.y - 1) {
+		result[IX(x, y)] = (b[IX(x, y)] + coeff * (value[IX(x + 1, y)] + value[IX(x - 1, y)] + value[IX(x, y + 1)] + value[IX(x, y - 1)])) * inv_diam;
+		
+		if (id.x == 1) {
+			result[IX(0, id.y)] = type == 1 ? -result[IX(1, id.y)] : result[IX(1, id.y)];
+		}
+		if (id.x == resoloution.x - 2) {
+			result[IX(resoloution.x - 1, id.y)] = type == 1 ? -result[IX(resoloution.x - 2, id.y)] : result[IX(resoloution.x - 2, id.y)];
+		}
+		if (id.y == 1) {
+			result[IX(id.x, 0)] = type == 2 ? -result[IX(id.x, 1)] : result[IX(id.x, 1)];
+		}
+		if (id.y == resoloution.y - 2) {
+			result[IX(id.x, resoloution.y - 1)] = type == 2 ? -result[IX(id.x, resoloution.y - 2)] : result[IX(id.x, resoloution.y - 2)];
+		}
+	}
+}
+
+[numthreads(NUM_THREADS, NUM_THREADS, 1)]
+void CopyArray(uint3 id : SV_DispatchThreadID) {
+	int x = id.x;
+	int y = id.y;
+	if (x != 0 && x != resoloution.x - 1 && y != 0 && y != resoloution.y - 1) {
+		value[IX(x, y)] = result[IX(x, y)];
+	}
+}
+
+[numthreads(NUM_THREADS, NUM_THREADS, 1)]
+void DivergencePressure(uint3 id : SV_DispatchThreadID) {
+	int x = id.x;
+	int y = id.y;
+	if (x != 0 && x != resoloution.x - 1 && y != 0 && y != resoloution.y - 1) {
+		divergence[IX(x, y)] = -0.5f * (Velx[IX(x + 1, y)] - Velx[IX(x - 1, y)] + Vely[IX(x, y + 1)] - Vely[IX(x, y - 1)]);
+		pressure[IX(x, y)] = 0;
+		if (id.x == 1) {
+			divergence[IX(0, id.y)] = divergence[IX(1, id.y)];
+		}
+		if (id.x == resoloution.x - 2) {
+			divergence[IX(resoloution.x - 1, id.y)] =  divergence[IX(resoloution.x - 2, id.y)];
+		}
+		if (id.y == 1) {
+			divergence[IX(id.x, 0)] = divergence[IX(id.x, 1)];
+		}
+		if (id.y == resoloution.y - 2) {
+			divergence[IX(id.x, resoloution.y - 1)] = divergence[IX(id.x, resoloution.y - 2)];
+		}
+	}
+}
+
+[numthreads(NUM_THREADS, NUM_THREADS, 1)]
+void GradientPressure(uint3 id : SV_DispatchThreadID) {
+	int x = id.x;
+	int y = id.y;
+	if (x != 0 && x != resoloution.x - 1 && y != 0 && y != resoloution.y - 1) {
+		Velx[IX(x, y)] -= 0.5f * (pressure[IX(x + 1, y)] - pressure[IX(x - 1, y)]);
+		Vely[IX(x, y)] -= 0.5f * (pressure[IX(x, y + 1)] - pressure[IX(x, y - 1)]);
+		if (id.x == 1) {
+			Velx[IX(0, id.y)] = -Velx[IX(1, id.y)];
+			Vely[IX(0, id.y)] = Vely[IX(1, id.y)];
+		}
+		if (id.x == resoloution.x - 2) {
+			Velx[IX(resoloution.x - 1, id.y)] = -Velx[IX(resoloution.x - 2, id.y)];
+			Vely[IX(resoloution.x - 1, id.y)] = Vely[IX(resoloution.x - 2, id.y)];
+		}
+		if (id.y == 1) {
+			Velx[IX(id.x, 0)] = Velx[IX(id.x, 1)];
+			Vely[IX(id.x, 0)] = -Vely[IX(id.x, 1)];
+		}
+		if (id.y == resoloution.y - 2) {
+			Velx[IX(id.x, resoloution.y - 1)] = Velx[IX(id.x, resoloution.y - 2)];
+			Vely[IX(id.x, resoloution.y - 1)] = -Vely[IX(id.x, resoloution.y - 2)];
+		}
+	}
+}
+
+[numthreads(NUM_THREADS, NUM_THREADS, 1)]
+void Advect(uint3 id : SV_DispatchThreadID) {
+	int i = id.x;
+	int j = id.y;
+	float fx, fy, x0, x1, y0, y1;
+	float ifloat = i;
+	float jfloat = j;
+	if (i != 0 && i != resoloution.x - 1 && j != 0 && j != resoloution.y - 1) {
+		float tempX = Velx[IX(i, j)] * dtx;
+		float tempY = Vely[IX(i, j)] * dty;
+		float x = ifloat - tempX;
+		float y = jfloat - tempY;
+		if (x < 0.5f) x = 0.5f;
+		if (x > resoloution.x + 0.5f) x = resoloution.x + 0.5f;
+		if (y < 0.5f) y = 0.5f;
+		if (y > resoloution.y + 0.5f) y = resoloution.y + 0.5f;
+		x0 = floor(x);
+		x1 = x0 + 1;
+		y0 = floor(y);
+		y1 = y0 + 1;
+		fy = y - y0;
+		fx = x - x0;
+		int x0i = (int)x0;
+		int x1i = (int)x1;
+		int y0i = (int)y0;
+		int y1i = (int)y1;
+		value[IX(i, j)] = BiLerp(
+			pValue[IX(x0i, y0i)],
+			pValue[IX(x1i, y0i)],
+			pValue[IX(x0i, y1i)],
+			pValue[IX(x1i, y1i)],
+			fx, fy);
+		if (id.x == 1) {
+			value[IX(0, id.y)] = type == 1 ? -value[IX(1, id.y)] : value[IX(1, id.y)];
+		}
+		if (id.x == resoloution.x - 2) {
+			value[IX(resoloution.x - 1, id.y)] = type == 1 ? -value[IX(resoloution.x - 2, id.y)] : value[IX(resoloution.x - 2, id.y)];
+		}
+		if (id.y == 1) {
+			value[IX(id.x, 0)] = type == 2 ? -value[IX(id.x, 1)] : value[IX(id.x, 1)];
+		}
+		if (id.y == resoloution.y - 2) {
+			value[IX(id.x, resoloution.y - 1)] = type == 2 ? -value[IX(id.x, resoloution.y - 2)] : value[IX(id.x, resoloution.y - 2)];
+		}
+	}
+}

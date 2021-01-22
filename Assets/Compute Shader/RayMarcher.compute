@@ -1,0 +1,537 @@
+﻿#pragma kernel RayMarching
+#pragma kernel VolumeRayCasting
+#pragma kernel Gyroid
+
+
+#define MAX_STEP 500
+#define MAX_DIST 300
+#define SURF_DIST 0.01
+#define PI 3.14159265358979323846264338327950288
+
+struct BoundingBox {
+	float3 center;
+	float3 origin;
+	float3 size;
+	float3 dataSize;
+	float3 resoloution;
+	float3 gridSpacing;
+};
+
+float interpolation = 0.5;
+float time;
+float3 lightPos;
+float3 cameraPos;
+float2 resoloution;
+float4 lightColor;
+float3 cameraEuler;
+
+StructuredBuffer<BoundingBox> boundingBox;
+StructuredBuffer<float> density;
+RWTexture2D<float4> Result;
+RWTexture2D<float4> Test;
+Texture2D<float4> Source;
+
+float lerp(float f0, float f1, float t) {
+	return (1 - t) * f0 + t * f1;
+}
+
+float bilerp(float f00, float f10, float f01, float f11, float tx, float ty) {
+	return lerp(lerp(f00, f10, tx), lerp(f01, f11, tx), ty);
+}
+
+float trilerp(float f000, float f100, float f010, float f110, float f001, float f101, float f011, float f111,
+	float tx, float ty, float tz) {
+	return lerp(bilerp(f000, f100, f010, f110, tx, ty), bilerp(f001, f101, f011, f111, tx, ty), tz);
+}
+
+float3 Rot(float3 euler, float3 dir) {
+	euler = euler * PI / 180;
+	float4x4 rotZMatrix = {
+		cos(euler.z), -sin(euler.z), 0, 0,
+		sin(euler.z), cos(euler.z), 0, 0,
+		0, 0, 1, 0,
+		0, 0, 0, 1
+	};
+	float4x4 rotYMatrix = {
+		cos(euler.y), 0, sin(euler.y), 0,
+		0, 1, 0, 0,
+		-sin(euler.y), 0, cos(euler.y), 0,
+		0, 0, 0, 1
+	};
+	float4x4 rotXMatrix = {
+		1, 0, 0, 0,
+		0, cos(euler.x), -sin(euler.x), 0,
+		0, sin(euler.x), cos(euler.x), 0,
+		0, 0, 0, 1
+	};
+	float4x4 rotMatrix = mul(mul(rotZMatrix, rotYMatrix), rotXMatrix);
+	return mul(rotMatrix, float4(dir.xyz, 1)).xyz;
+}
+
+float3 Transform(float3 p) {
+	p = Rot(float3(0, 0, p.z * 10), p);
+	p.z += time * 0.05;
+	return p;
+}
+
+float GetSphereDist(float3 p, float3 center, float r) {
+	return length(p - center) - r;
+}
+
+float GetPlaneDist(float3 p, float3 normal) {
+	return dot(p, normal);
+}
+
+float GetCapsuleDist(float3 p, float3 c1, float3 c2, float r) {
+	float3 c1_p = p - c1;
+	float3 c1_c2 = c2 - c1;
+	float proj = dot(c1_p, c1_c2) / dot(c1_c2, c1_c2);
+	proj = clamp(proj, 0, 1);
+	float3 proj_p = c1 + proj * c1_c2;
+	return length(p - proj_p) - r;
+}
+
+float GetTorusDist(float3 p, float3 c, float r1, float r2) {
+	float xz_dist = length(p.xz - c.xz) - r1;
+	float y_dist = p.y - c.y;
+	return length(float2(xz_dist, y_dist)) - r2;
+}
+
+float GetCubeDist(float3 p, float3 c, float3 size) {
+	float x = abs(p.x - c.x) - size.x;
+	float y = abs(p.y - c.y) - size.y;
+	float z = abs(p.z - c.z) - size.z;
+	float e = length(max(float3(x, y, z), 0));
+	float i = min(max(max(x, y), z), 0);
+	return e + i;
+}
+
+float GetCylinderDist(float3 p, float3 c1, float3 c2, float r) {
+	float3 c1_p = p - c1;
+	float3 c1_c2 = c2 - c1;
+	float proj = dot(c1_p, c1_c2) / dot(c1_c2, c1_c2);
+	float3 proj_p = c1 + proj * c1_c2;
+	float x = length(p - proj_p) - r;
+	float y = (abs(proj - 0.5) - 0.5) * length(c1_c2);
+	float e = length(max(float2(x, y), 0));
+	float i = min(max(x, y), 0);
+	return e + i;
+}
+
+float sdGyroid(float3 p, float scale, float thickness, float shift) {
+	p *= scale;
+	float gyroid = abs(dot(sin(p), cos(p).zxy) - shift) / scale - thickness;
+	return gyroid;
+}
+
+float Smin(float d1, float d2, float a) {
+	float h = clamp((d2 - d1) / a + 0.5, 0, 1);
+	float m = h * (1 - h) * 0.5 * a;
+	return h * d1 + (1 - h) * d2 - m;
+}
+
+float GetDist(float3 p) {
+	float sphereDist = GetSphereDist(p, float3(0, 2, 6), 0.5);
+	float planeDist = GetPlaneDist(p, float3(0 , 1, 0));
+	float capsuleDist = GetCapsuleDist(p, float3(1, 3, 5), float3(5, 3, 5), 0.5);
+	float torusDist = GetTorusDist(p, float3(5, 2, 3), 1, 0.2);
+	float cubeDist = GetCubeDist(p, float3(-3, 2.5, 3), float3(1, 1, 1));
+	float cylinderDist = GetCylinderDist(p, float3(-2.5, 2, 1), float3(-1, 1, 3), 0.5);
+	float d = min(planeDist, sphereDist);
+	d = Smin(d, capsuleDist, interpolation);
+	d = Smin(d, torusDist, interpolation);
+	d = Smin(d, cubeDist, interpolation);
+	d = Smin(d, cylinderDist, interpolation);
+	return d;
+}
+
+float GetGyroidDist(float3 p) {
+	p = Transform(p);
+	float g;
+	float g1 = sdGyroid(p, 5, 0.03, 1.4);
+	float g2 = sdGyroid(p, 10, 0.03, 0);
+	float g3 = sdGyroid(p, 25, 0.03, 0);
+	float g4 = sdGyroid(p, 33, 0.03, 0);
+	float g5 = sdGyroid(p, 40, 0.03, 0);
+	float g6 = sdGyroid(p, 47, 0.03, 0);
+	float g7 = sdGyroid(p, 55, 0.03, 0);
+
+	g = g1 - g2 * 0.3 - g3 * 0.2 + g4 * 0.1 + g5 * 0.1 - g6 * 0.1 - g7 * 0.1;
+	return g *0.7;
+}
+
+float4 Occulusion(float4 col, float3 p) {
+	float g2 = sdGyroid(p, 10, 0.03, 0);
+	col *= smoothstep(-0.07, 0.01, g2);
+	return col;
+}
+
+float RayMarcher(float3 ro, float3 rd) {
+	float dist = 0;
+	float dO = 0;
+	[loop]
+	for (int i = 0; i < MAX_STEP; i++) {
+		float3 p = ro + rd * dO;
+		dist = GetDist(p);
+		dO += dist;
+		if (dist < SURF_DIST || dO > MAX_DIST)
+			break;
+	}
+	return dO;
+}
+
+float RayCasting(float3 ro, float3 rd) {
+	float dO = 0;
+	float dist = 0;
+	[loop]
+	for (int i = 0; i < MAX_STEP; i++) {
+		float3 p = ro + dO * rd;
+		dist = GetCubeDist(p, boundingBox[0].center, boundingBox[0].size);
+		dO += abs(dist);
+		if (abs(dist) < SURF_DIST || dO > MAX_DIST) {
+			break;
+		}
+	}
+	return dO;
+}
+
+float GyroidRayMarcher(float3 ro, float3 rd) {
+	float dist = 0;
+	float dO = 0;
+	[loop]
+	for (int i = 0; i < MAX_STEP; i++) {
+		float3 p = ro + dO * rd;
+		dist = GetGyroidDist(p);
+		dO += dist;
+		if (dist < SURF_DIST || dO > MAX_DIST)
+			break;
+	}
+	return dO;
+}
+
+float3 GetNormal(float3 p) {
+	float d = GetDist(p);
+	float2 e = float2(0.01, 0);
+	float3 n = d - float3(
+		GetDist(p - e.xyy),
+		GetDist(p - e.yxy),
+		GetDist(p - e.yyx));
+	return normalize(n);
+}
+
+float3 GetNormalGyroid(float3 p) {
+	float d = GetGyroidDist(p);
+	float2 e = float2(0.05, 0);
+	float3 n = d - float3(
+		GetGyroidDist(p - e.xyy),
+		GetGyroidDist(p - e.yxy),
+		GetGyroidDist(p - e.yyx));
+	return normalize(n);
+}
+
+float3 GetNormalBoundBox(float3 p) {
+	float d = GetCubeDist(p, boundingBox[0].center, boundingBox[0].size);
+	float2 e = float2(0.01, 0);
+	float3 n = d - float3(
+		GetCubeDist(p - e.xyy, boundingBox[0].center, boundingBox[0].size),
+		GetCubeDist(p - e.yxy, boundingBox[0].center, boundingBox[0].size),
+		GetCubeDist(p - e.yyx, boundingBox[0].center, boundingBox[0].size));
+	return normalize(n);
+}
+
+float4 Diffuse(float3 p) {
+	float3 lPos = lightPos;
+	float3 lDir = normalize(lPos - p);
+	float3 n = GetNormal(p);
+	float ndotl = clamp(dot(n, lDir), 0, 1);
+	return ndotl * lightColor;
+}
+
+float4 DiffuseGyroid(float3 p) {
+	float3 n = GetNormalGyroid(p);
+	float diff = (n.y * 0.5 + 0.5);
+	diff *= diff * diff * 0.8;
+	return diff * lightColor;
+}
+
+float4 DiffuseBoundingBox(float3 p) {
+	float3 lPos = lightPos;
+	float3 lDir = normalize(lPos - p);
+	float3 n = GetNormalBoundBox(p);
+	float ndotl = clamp(dot(n, lDir), 0, 1);
+	return ndotl * lightColor;
+}
+
+bool CastShadow(float3 p) {
+	float3 lPos = lightPos;
+	float3 lDir = normalize(lPos - p);
+	float d = RayMarcher(p, lDir);
+	if (d < length(lPos - p))
+		return true;
+	else
+		return false;
+}
+
+float4 Crack(float3 p) {
+	float g2 = sdGyroid(p, 10, 0.03, 0);
+	float3 n = GetNormalGyroid(p);
+	float crackWidth = smoothstep(0.1, 0, n.y) * 0.01 - 0.02;
+	float crack = smoothstep(crackWidth, -0.03, g2);
+	float g3 = sdGyroid(p + time * 0.08, 5, 0.03, 0);
+	float g4 = sdGyroid(p - time * 0.05, 4, 0.03, 0);
+	crack *= g3 * g4 * 30 + smoothstep(0.2, 0, n.y) ;
+	return crack * float4(1, 0.32, 0, 1);
+}
+
+float4 Flicker(float3 p) {
+	float g = sdGyroid(p - float3(0, time * 0.9, 0), 3, 0.03, 0.3);
+	return g * float4(1, 0.14, 0, 1);
+}
+
+float4 BackGround(float3 rd) {
+	float y = rd.y * 0.5 + 0.5;
+	float4 col = float4(1, 0.32, 0, 1);
+	col *= (1 - y) + 0.2;
+	float a = atan(rd.xz);
+	float flame = sin(a * 10 + time) * sin(a * 7 - time) * sin(a * 6);
+	flame *= smoothstep(0.8, 0, y);
+	col += flame;
+	col = max(col, 0);
+	col += smoothstep(0.5, 0, y);
+	return col;
+}
+
+void GetAxisIndex(float x, float min, float max, out int i, out float f) {
+	float s = floor(x);
+	float offset = min;
+	min -= offset;
+	max -= offset;
+	s -= offset;
+	if (max == min) {
+		i = (int)min;
+		f = 0;
+	}
+	else if (s >= max - 1){
+		i = (int)max - 1;
+		f = 1;
+	}
+	else if (s < min) {
+		i = (int)min;
+		f = 0;
+	}
+	else {
+		i = (int)s;
+		f = x - s;
+	}
+}
+
+int3 Get3DBoxIndex(float3 pos) {
+	float3 normalizedPos = (pos - boundingBox[0].origin) / boundingBox[0].gridSpacing;
+	float3 ds = boundingBox[0].resoloution;
+	int i, j, k;
+	float fx, fy, fz;
+	GetAxisIndex(normalizedPos.x, 0, ds.x, i, fx);
+	GetAxisIndex(normalizedPos.y, 0, ds.y, j, fy);
+	GetAxisIndex(normalizedPos.z, 0, ds.z, k, fz);
+	return int3(i, j, k);
+}
+
+int Convert3DTo1D(int3 idx, float3 ds) {
+	return (int)(idx.z * ds.y * ds.x + idx.y * ds.x + idx.x);
+}
+
+float LinearSample(float3 pos, out int3 idx3) {
+	float3 normalizedPos = (pos - boundingBox[0].origin) / boundingBox[0].gridSpacing;
+	float3 ds = boundingBox[0].resoloution;
+	int i, j, k;
+	float fx, fy, fz;
+	GetAxisIndex(normalizedPos.x, 0, ds.x, i, fx);
+	GetAxisIndex(normalizedPos.y, 0, ds.y, j, fy);
+	GetAxisIndex(normalizedPos.z, 0, ds.z, k, fz);
+	idx3 = int3(i, j, k);
+	int ip1 = min(i + 1, ds.x - 1);
+	int jp1 = min(j + 1, ds.y - 1);
+	int kp1 = min(k + 1, ds.z - 1);
+	return trilerp(
+		density[Convert3DTo1D(int3(i, j, k), ds)],
+		density[Convert3DTo1D(int3(ip1, j, k), ds)],
+		density[Convert3DTo1D(int3(i, jp1, k), ds)],
+		density[Convert3DTo1D(int3(ip1, jp1, k), ds)],
+		density[Convert3DTo1D(int3(i, j, kp1), ds)],
+		density[Convert3DTo1D(int3(ip1, j, kp1), ds)],
+		density[Convert3DTo1D(int3(i, jp1, kp1), ds)],
+		density[Convert3DTo1D(int3(ip1, jp1, kp1), ds)],
+		fx, fy, fz);
+}
+
+float3 Gradient(int3 idx, float value) {
+	float3 gs = boundingBox[0].gridSpacing;
+	float3 ds = boundingBox[0].dataSize;
+	int right = Convert3DTo1D(min(idx + int3(1, 0, 0), ds - float3(1, 1, 1)),ds);
+	int up = Convert3DTo1D(min(idx + int3(0, 1, 0), ds - float3(1, 1, 1)), ds);
+	int forward = Convert3DTo1D(min(idx + int3(0, 0, 1), ds - float3(1, 1, 1)), ds);
+	return -normalize(float3(
+		(density[right] - value) / gs.x,
+		(density[up] - value) / gs.y,
+		(density[forward] - value) / gs.z)
+	);
+}
+
+float4 VoxelSampleIsosurface(float3 entry, float3 end, float3 rd, float4 bgColor) {
+	float3 current = entry;
+	float3 gs = boundingBox[0].gridSpacing;
+	float step = min(gs.x, min(gs.y, gs.z)) * 0.5;
+	float3 ds = boundingBox[0].dataSize;
+	float4 color = bgColor;
+	[loop]
+	for (int i = 0; i < MAX_STEP; i++) {
+		current += rd * step;
+		int3 idx3 = Get3DBoxIndex(current);
+		int idx = Convert3DTo1D(idx3, ds);
+		float den = density[idx];
+		if (den > 0) {
+			current -= rd * step * 0.5;
+			idx3 = Get3DBoxIndex(current);
+			idx = Convert3DTo1D(idx3, ds);
+			den = density[idx];
+			current -= rd * step * (den > 0 ? 0.25 : -0.25);
+			idx3 = Get3DBoxIndex(current);
+			idx = Convert3DTo1D(idx3, ds);
+			den = density[idx];
+			float3 L = normalize(lightPos - current);
+			float3 R = -normalize(rd);
+			float3 H = normalize(L + R);
+			float3 N = Gradient(idx3, den);
+			float Ia = 0.1;
+			float Id = clamp(dot(L, N), 0, 1) * 1;
+			float Is = 8.0 * pow(clamp(dot(N, H), 0, 1), 600);
+			color = (Ia + Id) * float4(0.5, 0.5, 0.5, 1) + Is * float4(1, 1, 1, 1);
+			break;
+		}
+	}
+	return color;
+}
+
+float4 RegularSampleIsosurface(float3 entry, float3 end, float3 rd, float4 bgColor) {
+	float3 current = entry;
+	float3 gs = boundingBox[0].gridSpacing;
+	float step = min(gs.x, min(gs.y, gs.z)) * 0.5;
+	float3 ds = boundingBox[0].dataSize;
+	float4 color = bgColor;
+	int3 idx3;
+	[loop]
+	for (int i = 0; i < MAX_STEP; i++) {
+		current += rd * step;
+		float den = LinearSample(current, idx3);
+		if (den > 0) {
+			current -= rd * step * 0.5;
+			den = LinearSample(current, idx3);
+			current -= rd * step * (den > 0 ? 0.25 : -0.25);
+			den = LinearSample(current, idx3);
+			float3 L = normalize(lightPos - current);
+			float3 R = -normalize(rd);
+			float3 H = normalize(L + R);
+			float3 N = Gradient(idx3, den);
+			float Ia = 0.1;
+			float Id = clamp(dot(L, N), 0, 1) * 1;
+			float Is = 8.0 * pow(clamp(dot(N, H), 0, 1), 600);
+			color = (Ia + Id) * float4(0.5, 0.5, 0.5, 1) + Is * float4(1, 1, 1, 1);
+			break;
+		}
+	}
+	return color;
+}
+
+float4 Color_transfer(float value) {
+	float ki = 1;
+	float3 low = float3(0, 0, 0);
+	float3 high = float3(1, 1, 1);
+	float alpha = (exp(value * ki) - 1.0) / (exp(ki) - 1.0);
+	return float4((value * high + (1.0 - value) * low).xyz, alpha);
+}
+
+float4 VoxelSampleAlphaBending(float3 entry, float3 end, float3 rd, float4 bgColor) {
+	float3 current = entry;
+	float3 gs = boundingBox[0].gridSpacing;
+	float step = min(gs.x, min(gs.y, gs.z)) * 0.5;
+	float3 ds = boundingBox[0].dataSize;
+	float3 materialColor = float3(0.5, 0.5, 0.5);
+	float4 color = float4(0, 0, 0, 0);
+	[loop]
+	for (int i = 0; i < MAX_STEP; i++) {
+		current += rd * step;
+		int3 idx3 = Get3DBoxIndex(current);
+		int idx = Convert3DTo1D(idx3, ds);
+		float den = density[idx];
+		float4 c = Color_transfer(den);
+		color.rgb = (1 - c.a * c.rgb + (1 - c.a) * color.rgb * color.a) * materialColor;
+		color.a = c.a + (1 - c.a) * color.a;
+		if (color.a >= 1)
+			break;
+	}
+	color.rgb = color.a * color.rgb + (1 - color.a) * bgColor.rgb;
+	color.a = 1;
+	return color;
+}
+
+[numthreads(8, 8, 1)]
+void RayMarching(uint3 id : SV_DispatchThreadID)
+{
+	Result[id.xy] = Source[id.xy];
+	float3 ro = cameraPos;
+	float2 uv = (id.xy - 0.5 * resoloution) / resoloution.y;
+	float3 rd = Rot(cameraEuler, normalize(float3(uv.xy, 1)));
+	float d = RayMarcher(ro, rd);
+	
+	if (d < MAX_DIST) {
+		float3 p = ro + rd * d;
+		float3 n = GetNormal(p);
+		float4 diff = Diffuse(p);
+		diff = CastShadow(p + n * SURF_DIST * 2) ? diff * 0.3 : diff;
+		Result[id.xy] = diff;
+	}	
+}
+
+[numthreads(8, 8, 1)]
+void VolumeRayCasting(uint3 id : SV_DispatchThreadID) 
+{
+	Result[id.xy] = Source[id.xy];
+	float3 ro = cameraPos;
+	float2 uv = (id.xy - 0.5 * resoloution) / resoloution.y;
+	float3 rd = Rot(cameraEuler, normalize(float3(uv.xy, 1)));
+	float d1 = RayCasting(ro, rd);
+	if (d1 < MAX_DIST) {
+		float3 entry = ro + rd * d1;
+		float3 n1 = GetNormalBoundBox(entry);
+		float d2 = RayCasting(entry - n1  * SURF_DIST * 2, rd);
+		if (d2 < MAX_DIST) {
+			float3 end = entry - n1 * SURF_DIST * 2 + rd * d2;
+			float4 color = VoxelSampleAlphaBending(entry - n1 * SURF_DIST * 2, end, rd, Source[id.xy]);
+			//float4 diff = DiffuseBoundingBox(end);
+			Result[id.xy] = color;
+		}
+	}
+}
+
+[numthreads(8, 8, 1)]
+void Gyroid(uint3 id : SV_DispatchThreadID)
+{
+	Result[id.xy] = Source[id.xy];
+	float3 ro = cameraPos;
+	float2 uv = (id.xy - 0.5 * resoloution) / resoloution.y;
+	uv += sin(uv * 30) * 0.015;
+	float3 rd = Rot(cameraEuler, normalize(float3(uv.xy, 1)));
+	float d = GyroidRayMarcher(ro, rd);
+	if (d < MAX_DIST) {
+		float3 p = ro + rd * d;
+		float4 diff = DiffuseGyroid(p);
+		p = Transform(p);
+		diff = Occulusion(diff, p);
+		diff += Crack(p);
+		diff += Flicker(p);
+		diff += smoothstep(0.5, -5.5, p.y);
+		diff *= 1 - dot(uv, uv);
+		float4 bg = BackGround(rd);
+		Result[id.xy] = (1 - smoothstep(0, 7, d)) * diff + smoothstep(0, 7, d) * bg;
+	}
+}

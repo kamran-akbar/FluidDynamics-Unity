@@ -1,0 +1,114 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel MvmKernel
+#pragma kernel ResidualKernel
+#pragma kernel PairwiseMultKernel
+#pragma kernel SumKernel
+#pragma kernel RelaxKernel
+
+struct MatrixRow {
+	float right;
+	float up;
+	float forward;
+	float center;
+};
+
+RWStructuredBuffer<float> result;
+StructuredBuffer<float> x;
+StructuredBuffer<float> b;
+StructuredBuffer<MatrixRow> A;
+
+float length;
+float halfLength;
+float3 ds;
+
+int Convert3DTo1D(int3 idx) {
+	return (int)(idx.z * ds.y * ds.x + idx.y * ds.x + idx.x);
+}
+
+float square(float x) {
+	return x * x;
+}
+
+void mvm(int3 idx) {
+	int index = Convert3DTo1D(idx);
+	result[index] = A[index].center * x[index] +
+		+((idx.x > 0) ? A[Convert3DTo1D(int3(idx.x - 1, idx.yz))].right * x[Convert3DTo1D(int3(idx.x - 1, idx.yz))] : 0)
+		+ ((idx.x + 1 < ds.x) ? A[index].right * x[Convert3DTo1D(int3(idx.x + 1, idx.yz))] : 0)
+		+ ((idx.y > 0) ? A[Convert3DTo1D(int3(idx.x, idx.y - 1, idx.z))].up * x[Convert3DTo1D(int3(idx.x, idx.y - 1, idx.z))] : 0)
+		+ ((idx.y + 1 < ds.y) ? A[index].up * x[Convert3DTo1D(int3(idx.x, idx.y + 1, idx.z))] : 0)
+		+ ((idx.z > 0) ? A[Convert3DTo1D(int3(idx.xy, idx.z - 1))].forward * x[Convert3DTo1D(int3(idx.xy, idx.z - 1))] : 0)
+		+ ((idx.z + 1 < ds.z) ? A[index].forward * x[Convert3DTo1D(int3(idx.xy, idx.z + 1))] : 0);
+}
+
+void residual(int3 idx) {
+	int index = Convert3DTo1D(idx);
+	float mvm = A[index].center * x[index] +
+		+ ((idx.x > 0) ? A[Convert3DTo1D(int3(idx.x - 1, idx.yz))].right * x[Convert3DTo1D(int3(idx.x - 1, idx.yz))] : 0)
+		+ ((idx.x + 1 < ds.x) ? A[index].right * x[Convert3DTo1D(int3(idx.x + 1, idx.yz))] : 0)
+		+ ((idx.y > 0) ? A[Convert3DTo1D(int3(idx.x, idx.y - 1, idx.z))].up * x[Convert3DTo1D(int3(idx.x, idx.y - 1, idx.z))] : 0)
+		+ ((idx.y + 1 < ds.y) ? A[index].up * x[Convert3DTo1D(int3(idx.x, idx.y + 1, idx.z))] : 0)
+		+ ((idx.z > 0) ? A[Convert3DTo1D(int3(idx.xy, idx.z - 1))].forward * x[Convert3DTo1D(int3(idx.xy, idx.z - 1))] : 0)
+		+ ((idx.z + 1 < ds.z) ? A[index].forward * x[Convert3DTo1D(int3(idx.xy, idx.z + 1))] : 0);
+	result[index] = b[index] - mvm;
+}
+
+void selfPairWiseMult(int3 idx) {
+	int index = Convert3DTo1D(idx);
+	result[index] = x[index] * x[index];
+}
+
+void sum(int3 idx) {
+	int index = Convert3DTo1D(idx);
+	if (index < halfLength) {
+		if (index + halfLength < length) {
+			result[index] = result[index] + result[index + halfLength];
+		}
+	}
+}
+
+void relax(int3 idx) {
+	int index = Convert3DTo1D(idx);
+	float r = 
+		((idx.x > 0) ? A[Convert3DTo1D(int3(idx.x - 1, idx.yz))].right * x[Convert3DTo1D(int3(idx.x - 1, idx.yz))] : 0)
+		+ ((idx.x + 1 < ds.x) ? A[index].right * x[Convert3DTo1D(int3(idx.x + 1, idx.yz))] : 0)
+		+ ((idx.y > 0) ? A[Convert3DTo1D(int3(idx.x, idx.y - 1, idx.z))].up * x[Convert3DTo1D(int3(idx.x, idx.y - 1, idx.z))] : 0)
+		+ ((idx.y + 1 < ds.y) ? A[index].up * x[Convert3DTo1D(int3(idx.x, idx.y + 1, idx.z))] : 0)
+		+ ((idx.z > 0) ? A[Convert3DTo1D(int3(idx.xy, idx.z - 1))].forward * x[Convert3DTo1D(int3(idx.xy, idx.z - 1))] : 0)
+		+ ((idx.z + 1 < ds.z) ? A[index].forward * x[Convert3DTo1D(int3(idx.xy, idx.z + 1))] : 0);
+	result[index] = (b[index] - r) / A[index].center;
+}
+
+[numthreads(8, 8, 8)]
+void MvmKernel(uint3 id : SV_DispatchThreadID)
+{
+	int3 idx = id.xyz;
+	mvm(idx);
+}
+
+[numthreads(8, 8, 8)]
+void ResidualKernel(uint3 id : SV_DispatchThreadID)
+{
+	int3 idx = id.xyz;
+	residual(idx);
+}
+
+[numthreads(8, 8, 8)]
+void PairwiseMultKernel(uint3 id : SV_DispatchThreadID)
+{
+	int3 idx = id.xyz;
+	selfPairWiseMult(idx);
+}
+
+[numthreads(8, 8, 8)]
+void SumKernel(uint3 id : SV_DispatchThreadID)
+{
+	int3 idx = id.xyz;
+	sum(idx);
+}
+
+[numthreads(8, 8, 8)]
+void RelaxKernel(uint3 id : SV_DispatchThreadID)
+{
+	int3 idx = id.xyz;
+	relax(idx);
+}
